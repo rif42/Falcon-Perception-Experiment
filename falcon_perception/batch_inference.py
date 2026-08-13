@@ -7,9 +7,17 @@ from torch import Tensor
 
 from falcon_perception.attention import create_batch_attention_mask
 from falcon_perception.aux_output import AuxOutput
-from falcon_perception.data import ImageProcessor, load_images, tokenize_inputs, get_pos_thw, pad_sequences_left
+from falcon_perception.data import (
+    ImageProcessor,
+    anyup_canvas_size,
+    get_pos_thw,
+    load_images,
+    pad_sequences_left,
+    tokenize_inputs,
+)
 from falcon_perception.kv_cache import KVCacheBase
 from falcon_perception.model import FalconPerception, ImgScatterEntry
+from falcon_perception.nvtx import nvtx_range
 from falcon_perception.sampling import sample_token
 
 
@@ -56,8 +64,13 @@ def process_batch_and_generate(
     assert tokenizer.pad_token_id is not None, "tokenizer.pad_token_id must be set for batching"
     padded_np = pad_sequences_left(all_input_ids, tokenizer.pad_token_id)
 
+    max_h = max(img.shape[1] for img in all_selected_images)
+    max_w = max(img.shape[2] for img in all_selected_images)
+    canvas, _ = anyup_canvas_size(
+        max_h, max_w, patch_size=patch_size, max_size=max_dimension,
+    )
     processed = processor_local.batch_images_with_mask(
-        all_selected_images, max_dimension, max_dimension
+        all_selected_images, canvas, canvas
     )
     assert processed is not None
     pos_t_np, pos_hw_np = get_pos_thw(
@@ -182,6 +195,8 @@ class BatchInferenceEngine:
         seed: int | None = None,
         coord_dedup_threshold: float = 0.01,
         task: str = "segmentation",
+        hr_upsample_ratio: int = 8,
+        shrink_image: bool = True,
     ):
         device = tokens.device
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
@@ -230,24 +245,29 @@ class BatchInferenceEngine:
                 img_scatter_info.append(ImgScatterEntry(b, int(img_pos[0]), len(img_pos), h_v, w_v))
 
         # Prefill
-        logits_BSV, h_BSD = self.model(
-            tokens=tokens,  # Original sequence, no padding
-            rope_pos_t=pos_t,
-            rope_pos_hw=pos_hw,
-            attention_mask=attention_mask,
-            kv_cache=kv_cache,
-            pixel_values=pixel_values,
-            coord_xy=coord_xy,
-            size_hw=size_hw,
-            img_scatter_info=img_scatter_info or None,
-            flex_attn_kernel_options=self.kernel_options or None,
-        )
-
-        hr_image_features = None
-        if task == "segmentation":
-            hr_image_features = self.model.upsample_img_features(
-                h_BSD, pixel_values, img_scatter_info,
+        with nvtx_range("prefill"):
+            logits_BSV, h_BSD = self.model(
+                tokens=tokens,  # Original sequence, no padding
+                rope_pos_t=pos_t,
+                rope_pos_hw=pos_hw,
+                attention_mask=attention_mask,
+                kv_cache=kv_cache,
+                pixel_values=pixel_values,
+                coord_xy=coord_xy,
+                size_hw=size_hw,
+                img_scatter_info=img_scatter_info or None,
+                flex_attn_kernel_options=self.kernel_options or None,
             )
+
+            hr_image_features = None
+            if task == "segmentation":
+                _, _, H, W, _ = pixel_values.shape
+                output_size = (H // ps * hr_upsample_ratio, W // ps * hr_upsample_ratio)
+                hr_image_features = self.model.upsample_img_features(
+                    h_BSD, pixel_values, img_scatter_info,
+                    output_size=output_size,
+                    shrink_image=shrink_image,
+                )
 
         aux_outputs: list[AuxOutput] = [AuxOutput() for _ in range(B)]
         stop_token_ids = stop_token_ids or [self.tokenizer.eos_token_id]
@@ -292,31 +312,33 @@ class BatchInferenceEngine:
                     for i, b in enumerate(sample_w_segm.tolist()):
                         aux_outputs[b].append_segm(segm_embeds[i])
 
-            logits_BSV, h_BSD = self.model(
-                tokens=tokens_B1,
-                attention_mask=attention_mask,
-                coord_xy=xy_b2.to(self.model.dtype),
-                size_hw=hw_b2.to(self.model.dtype),
-                kv_cache=kv_cache,
-                flex_attn_kernel_options=self.kernel_options or None,
-            )
+            with nvtx_range("decode"):
+                logits_BSV, h_BSD = self.model(
+                    tokens=tokens_B1,
+                    attention_mask=attention_mask,
+                    coord_xy=xy_b2.to(self.model.dtype),
+                    size_hw=hw_b2.to(self.model.dtype),
+                    kv_cache=kv_cache,
+                    flex_attn_kernel_options=self.kernel_options or None,
+                )
 
             hit_stop_B = torch.isin(tokens_B1, stop_ids).any(dim=-1)
             should_stop_B = should_stop_B.logical_or(hit_stop_B)
 
         # Batch-finalize segmentation masks per image.
-        # hr_image_features are at the padded canvas size (max_dim x max_dim).
-        # Crop each to the actual image extent (remove batch padding) so masks
-        # are produced at the model's processing resolution, not the padded size.
+        # hr_image_features are at AnyUp output_size; crop to the unpadded
+        # image extent scaled by hr_upsample_ratio / patch_size.
         for b in range(B):
             hr_feat_b = None
             if hr_image_features is not None:
-                hr_feat_b = hr_image_features[b]  # (D, H_pad, W_pad)
-                mask_b = pixel_mask[b, 0]        # (H_pad, W_pad)
+                hr_feat_b = hr_image_features[b]  # (D, out_H, out_W)
+                mask_b = pixel_mask[b, 0]        # (H_canvas, W_canvas)
                 h_actual = int(mask_b.any(dim=1).sum())
                 w_actual = int(mask_b.any(dim=0).sum())
-                if h_actual > 0 and w_actual > 0:
-                    hr_feat_b = hr_feat_b[:, :h_actual, :w_actual]
+                h_px = (h_actual // ps) * hr_upsample_ratio
+                w_px = (w_actual // ps) * hr_upsample_ratio
+                if h_px > 0 and w_px > 0:
+                    hr_feat_b = hr_feat_b[:, :h_px, :w_px]
             aux_outputs[b].finalize(
                 hr_image_features=hr_feat_b,
                 task=task,

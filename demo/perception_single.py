@@ -27,6 +27,7 @@ from falcon_perception import (
     setup_torch_config,
 )
 from falcon_perception.data import load_image, stream_samples_from_hf_dataset
+from falcon_perception.nvtx import nvtx_range
 
 setup_torch_config()
 
@@ -135,7 +136,7 @@ def main(
         # Warmup absorbs torch.compile cost
         print("Warmup run ...")
         warmup_seqs = _make_sequences()
-        with cuda_timed(reset_peak_memory=False) as warmup_timer:
+        with cuda_timed(reset_peak_memory=False) as warmup_timer, nvtx_range("Warmup"):
             engine.generate(
                 warmup_seqs,
                 sampling_params=sampling_params,
@@ -146,12 +147,13 @@ def main(
 
         print("Running inference ...")
         sequences = _make_sequences()
-        engine.generate(
-            sequences,
-            sampling_params=sampling_params,
-            use_tqdm=True,
-            print_stats=True,
-        )
+        with nvtx_range("Generate"):
+            engine.generate(
+                sequences,
+                sampling_params=sampling_params,
+                use_tqdm=True,
+                print_stats=True,
+            )
 
         seq = sequences[0]
         aux = seq.output_aux

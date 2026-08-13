@@ -18,12 +18,14 @@ from tqdm import tqdm
 
 from falcon_perception.aux_output import AuxOutput
 from falcon_perception.data import (
+    anyup_canvas_size,
     get_pos_thw_single,
     load_image,
     resize_image_if_necessary,
     tokenize_inputs,
 )
 from falcon_perception.model import FalconPerception, ImgScatterEntry
+from falcon_perception.nvtx import nvtx_range
 from falcon_perception.paged_attention import PagedKVCache
 from falcon_perception.sampling import sample_token
 
@@ -67,6 +69,9 @@ class SamplingParams:
     segmentation_threshold: float = 0.3
     coord_dedup_threshold: float = 0.00
     hr_upsample_ratio: int = 8
+    # When True, area-pool the AnyUp RGB input down to ``output_size`` before
+    # the image encoder (default). Disable to match the original full-res path.
+    shrink_image: bool = True
 
 
 @dataclass
@@ -572,15 +577,19 @@ class PagedInferenceEngine:
                 h_valid = seq.image_tensor.shape[1] // ps
                 w_valid = seq.image_tensor.shape[2] // ps
 
-                # Re-pad to square max_image_size for AnyUp training consistency.
+                # Square AnyUp canvas: snap output (and thus canvas) onto the
+                # 128 grid in [128, max_image_size]. A 768 image with ratio=8
+                # runs at 768 / 384 instead of always 1024 / 512.
                 pv = pixel_values_list[img_idx]  # (T, H_native, W_native, C)
-                target = ((seq.max_image_size + ps - 1) // ps) * ps
                 _, h_cur, w_cur, _ = pv.shape
+                target, output_size = anyup_canvas_size(
+                    h_cur, w_cur,
+                    patch_size=ps,
+                    upsample_ratio=ratio,
+                    max_size=seq.max_image_size,
+                )
                 if h_cur < target or w_cur < target:
                     pv = F.pad(pv, (0, 0, 0, target - w_cur, 0, target - h_cur))
-
-                target_patches = target // ps
-                output_size = (target_patches * ratio, target_patches * ratio)
 
                 hr_feat = self.model.upsample_single_img_features(
                     seq_h,
@@ -589,6 +598,7 @@ class PagedInferenceEngine:
                     h_valid=h_valid,
                     w_valid=w_valid,
                     output_size=output_size,
+                    shrink_image=seq.sampling_params.shrink_image,
                 )
 
                 # Crop to original (unpadded) pixel dimensions.
@@ -605,6 +615,9 @@ class PagedInferenceEngine:
                 if seq._hr_cache_hit:
                     seq.hr_image_features = gpu_futures[id(seq)]
 
+    # NVTX wraps the whole engine prefill step (outside compiled regions /
+    # CUDA-graph capture). Nested upsample ranges fire from upsample calls.
+    @nvtx_range("prefill")
     def prefill_sequences(self, sequences: list[Sequence]):
         # NOTE: there are two kind of positional indices
         # 1. `input_pos` which count the token indices in the sequence so far
@@ -1031,6 +1044,9 @@ class PagedInferenceEngine:
         return logits_BSV, h_BSD
 
 
+    # NVTX outside CUDA-graph capture/replay body — wraps graph.replay()
+    # without baking markers into the captured graph.
+    @nvtx_range("decode")
     def decode_step(self, sequences: list[Sequence]):
         """Sync-free decode step — no GPU→CPU reads on the hot path."""
         logits_BSV, h_BSD = self._decode_forward(sequences)
