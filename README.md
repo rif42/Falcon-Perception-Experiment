@@ -24,6 +24,14 @@ A minimal, readable yet performant PyTorch inference engine implementation of **
 
 > *"Extract the text content from this image."* → text / latex formulas / html table ... 
 
+# Report for P0-safety experiments
+
+Falcon is relatively fast for its size, but it really depends on the image size (yes you can feed it any image size). The memory requirement also doubles as the images get bigger, bcs sometimes i get memory error when inferencing 1024px img.
+
+Falcon can only do one class detection for a single pass. To detect multiple classes of objects, i made `perception_multi.py`. It works by simply looping the inference of the image with the classes we inputted, then merge all the bounding boxes in the final image.
+
+Falcon can do single positive object detection quite well, roughly on par with our current model. But it struggles a lot on negative class, so its really not feasible if we want to use negative classes 
+
 
 ## Contents
 - [Quick Start](#quick-start)
