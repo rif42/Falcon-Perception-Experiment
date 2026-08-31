@@ -49,6 +49,155 @@ from falcon_perception.nvtx import nvtx_range
 
 setup_torch_config()
 
+# --- merged labeled overlay helpers ---
+_PALETTE_UINT8_MERGED: list[tuple[int, int, int]] = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+    (0, 255, 255), (255, 128, 0), (128, 0, 255), (0, 255, 128), (255, 0, 128),
+]
+_COLOR_NAMES_MERGED = ["red", "green", "blue", "yellow", "magenta", "cyan", "orange", "purple", "springgreen", "deeppink"]
+
+
+def _save_merged_labeled_image(
+    pil_image,
+    flat_detections: list[dict],
+    class_names: list[str],
+    out_path,
+    *,
+    task: str = "detection",
+) -> None:
+    """Save one image with ALL boxes/masks overlaid, each box labeled by class.
+
+    - One consistent color per class (by order in class_names).
+    - Bounding boxes are labeled with filled background + text.
+    - For segmentation, masks are composited per-class (same color as its boxes).
+    """
+    from pathlib import Path as _P
+    from PIL import Image as _Image, ImageDraw as _Draw, ImageFont as _Font
+    import numpy as _np
+
+    out_path = _P(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    W, H = pil_image.size
+    base = _np.array(pil_image.convert("RGB"))  # (H,W,3) uint8
+
+    # per-class color map
+    cls_to_color = {c: _PALETTE_UINT8_MERGED[i % len(_PALETTE_UINT8_MERGED)] for i, c in enumerate(class_names)}
+    # no detections -> just save copy
+    if not flat_detections:
+        pil_image.convert("RGB").save(str(out_path), quality=95)
+        print(f"[merged] no detections, saved copy -> {out_path}")
+        return
+
+    # --- mask compositing (segmentation) — per-class color, index-map in one vectorised pass ---
+    if task == "segmentation":
+        masks = []
+        det_for_mask = []  # parallel to masks
+        for d in flat_detections:
+            m = d.get("mask")
+            if m is None:
+                continue
+            if isinstance(m, torch.Tensor):
+                m = m.detach().cpu().numpy()
+            m = _np.asarray(m)
+            # binarize if logits/prob
+            if m.dtype != _np.uint8:
+                m = (m > 0.5).astype(_np.uint8) if m.max() <= 1.5 else (m > 127).astype(_np.uint8)
+            if m.shape != (H, W):
+                m = _np.array(_Image.fromarray(m.astype(_np.uint8)).resize((W, H), resample=_Image.NEAREST))
+            masks.append(m)
+            det_for_mask.append(d)
+
+        if masks:
+            # order largest first so smallest wins (overwrites)
+            areas = [_np.sum(m) for m in masks]
+            order = sorted(range(len(masks)), key=lambda i: areas[i], reverse=True)
+            mask_idx = _np.full((H, W), -1, dtype=_np.int32)
+            for ri, oi in enumerate(order):
+                mask_idx[masks[oi] > 0] = ri
+            has_mask = mask_idx >= 0
+            if has_mask.any():
+                ordered_colors = _np.array(
+                    [cls_to_color[det_for_mask[order[i]]["label"]] for i in range(len(masks))],
+                    dtype=_np.uint8,
+                )  # (N,3)
+                clamped = _np.where(has_mask, mask_idx, 0)
+                fill_rgb = ordered_colors[clamped]  # (H,W,3)
+                alpha = 0.35
+                base = _np.where(
+                    has_mask[:, :, None],
+                    (alpha * fill_rgb.astype(_np.float32) + (1 - alpha) * base.astype(_np.float32) + 0.5).astype(_np.uint8),
+                    base,
+                )
+                # thin border from index-map edges
+                border = _np.zeros((H, W), dtype=bool)
+                border[:, 1:] |= mask_idx[:, 1:] != mask_idx[:, :-1]
+                border[:, :-1] |= mask_idx[:, 1:] != mask_idx[:, :-1]
+                border[1:, :] |= mask_idx[1:, :] != mask_idx[:-1, :]
+                border[:-1, :] |= mask_idx[1:, :] != mask_idx[:-1, :]
+                border &= has_mask
+                if border.any():
+                    bright = _np.clip(0.65 * ordered_colors.astype(_np.float32) + 89.25, 0, 255).astype(_np.uint8)
+                    border_rgb = bright[clamped]
+                    base[border] = border_rgb[border]
+
+    # --- draw labeled bboxes ---
+    pil_out = _Image.fromarray(base)
+    draw = _Draw.Draw(pil_out, "RGBA")
+    try:
+        font = _Font.load_default()
+    except Exception:
+        font = None
+
+    for det in flat_detections:
+        xy = det.get("xy")
+        hw = det.get("hw")
+        label = str(det.get("label") or "")
+        if xy is None:
+            continue
+        cx, cy = float(xy["x"]) * W, float(xy["y"]) * H
+        if hw and "w" in hw and "h" in hw:
+            bw, bh = float(hw["w"]) * W, float(hw["h"]) * H
+        else:
+            bw = bh = 10
+        x0 = max(0, int(round(cx - bw / 2)))
+        y0 = max(0, int(round(cy - bh / 2)))
+        x1 = min(W - 1, int(round(cx + bw / 2)))
+        y1 = min(H - 1, int(round(cy + bh / 2)))
+        color = cls_to_color.get(label, (255, 0, 0))
+        # box
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+        # label bg + text
+        if label:
+            # text size
+            if font is not None:
+                try:
+                    bbox = draw.textbbox((0, 0), label, font=font)
+                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                except Exception:
+                    tw, th = len(label) * 6 + 4, 10
+            else:
+                tw, th = len(label) * 6 + 4, 10
+            pad = 2
+            bg_x0, bg_y0 = x0, y0 - th - pad * 2
+            bg_x1, bg_y1 = x0 + tw + pad * 2, y0
+            # if not enough space above, draw inside top of box
+            if bg_y0 < 0:
+                bg_y0 = y0
+                bg_y1 = y0 + th + pad * 2
+                # keep inside image
+                if bg_y1 > H:
+                    bg_y1 = H
+            bg_x1 = min(W, bg_x1)
+            draw.rectangle([bg_x0, bg_y0, bg_x1, bg_y1], fill=color + (255,) if len(color) == 3 else color)
+            # choose text color by luminance
+            lum = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+            tcol = (0, 0, 0) if lum > 150 else (255, 255, 255)
+            draw.text((bg_x0 + pad, bg_y0 + pad // 2), label, fill=tcol, font=font)
+
+    pil_out.save(str(out_path), quality=95)
+    print(f"[merged] saved {out_path}  ({len(flat_detections)} boxes: {', '.join(class_names)})")
+
 
 @torch.inference_mode()
 def main(
@@ -209,9 +358,22 @@ def main(
             print(f"  {cls_name:20s} : {n} {'masks' if task=='segmentation' else 'boxes'}")
 
         render_paged_inference_outputs(sequences, image_processor, output_dir=out_dir, task=task)
+        # --- merged labeled image (all classes in one) ---
+        try:
+            from falcon_perception.visualization_utils import detections_from_sequence as _dets_from_seq
+            flat: list[dict] = []
+            for cls_name, seq in zip(classes, sequences):
+                for d in _dets_from_seq(seq):
+                    d2 = dict(d)
+                    d2["label"] = cls_name
+                    flat.append(d2)
+            _save_merged_labeled_image(pil_image, flat, classes, out_path / "merged.jpg", task=task)
+        except Exception as e:
+            print(f"[merged] skip ({e})")
         sub = "masks" if task == "segmentation" else "boxes"
         print(f"\n  Input image : {out_path / 'perception_input.jpg'}")
         print(f"  Output dir  : {out_path / sub}")
+        print(f"  Merged      : {out_path / 'merged.jpg'}")
 
     else:  # batch
         from falcon_perception.batch_inference import BatchInferenceEngine, process_batch_and_generate
@@ -272,9 +434,25 @@ def main(
         render_batch_inference_outputs(
             "BATCH", batch_inputs, aux_out, [], task, out_dir=out_dir, queries=classes,
         )
+        # --- merged labeled image (all classes in one) ---
+        try:
+            from falcon_perception.visualization_utils import detections_from_batch_aux as _dets_from_batch
+            flat: list[dict] = []
+            for idx, (cls_name, aux) in enumerate(zip(classes, aux_out)):
+                hw = (pil_image.size[1], pil_image.size[0])  # (H,W)
+                pm = batch_inputs.get("pixel_mask")
+                pm1 = pm[idx, 0] if isinstance(pm, torch.Tensor) and pm.ndim >= 3 else None
+                for d in _dets_from_batch(aux, pixel_mask_1hw=pm1, orig_hw=hw, segmentation=(task == "segmentation")):
+                    d2 = dict(d)
+                    d2["label"] = cls_name
+                    flat.append(d2)
+            _save_merged_labeled_image(pil_image, flat, classes, out_path / "merged.jpg", task=task)
+        except Exception as e:
+            print(f"[merged] skip ({e})")
 
         print(f"\n  Input image : {out_path / 'perception_input.jpg'}")
         print(f"  Output dir  : {out_path / 'masks'}")
+        print(f"  Merged      : {out_path / 'merged.jpg'}")
 
 
 if __name__ == "__main__":
