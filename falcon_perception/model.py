@@ -6,8 +6,12 @@ from typing import NamedTuple
 import einops as E
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None  # type: ignore
 from torch import Tensor as T
 from torch import nn
 from torch.nn.attention.flex_attention import (
@@ -166,35 +170,41 @@ class Attention(nn.Module):
 
 
 # FeedForward
-@triton.jit
-def _squared_relu_gate_kernel(
-    packed_ptr, out_ptr,
-    n_rows, n_cols,
-    in_row_stride, in_col_stride,
-    out_row_stride, out_col_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    n_elements = n_rows * n_cols
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+if triton is not None:
+    @triton.jit
+    def _squared_relu_gate_kernel(
+        packed_ptr, out_ptr,
+        n_rows, n_cols,
+        in_row_stride, in_col_stride,
+        out_row_stride, out_col_stride,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        n_elements = n_rows * n_cols
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
 
-    rows = offsets // n_cols
-    cols = offsets % n_cols
+        rows = offsets // n_cols
+        cols = offsets % n_cols
 
-    gate_idx = rows * in_row_stride + (2 * cols) * in_col_stride
-    up_idx = rows * in_row_stride + (2 * cols + 1) * in_col_stride
-    out_idx = rows * out_row_stride + cols * out_col_stride
+        gate_idx = rows * in_row_stride + (2 * cols) * in_col_stride
+        up_idx = rows * in_row_stride + (2 * cols + 1) * in_col_stride
+        out_idx = rows * out_row_stride + cols * out_col_stride
 
-    gate = tl.load(packed_ptr + gate_idx, mask=mask)
-    up = tl.load(packed_ptr + up_idx, mask=mask)
-    gate = tl.where(gate > 0, gate, 0.0)
-    out = gate * gate * up
-    tl.store(out_ptr + out_idx, out, mask=mask)
+        gate = tl.load(packed_ptr + gate_idx, mask=mask)
+        up = tl.load(packed_ptr + up_idx, mask=mask)
+        gate = tl.where(gate > 0, gate, 0.0)
+        out = gate * gate * up
+        tl.store(out_ptr + out_idx, out, mask=mask)
 
 
 def squared_relu_gate(packed: T, hidden_dim: int) -> T:
     """Fused relu(gate)^2 * up for interleaved packed [g0,u0,g1,u1,...] input."""
+    if triton is None:
+        # ponytail: pure torch fallback for CPU/Windows where triton is unavailable
+        gate = packed[..., 0::2]
+        up = packed[..., 1::2]
+        return F.relu(gate).square() * up
     packed_2d = packed.flatten(0, -2)
     n_rows = packed_2d.shape[0]
     n_cols = hidden_dim

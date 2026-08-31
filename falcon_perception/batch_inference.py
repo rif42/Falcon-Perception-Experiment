@@ -260,7 +260,7 @@ class BatchInferenceEngine:
             )
 
             hr_image_features = None
-            if task == "segmentation":
+            if task == "segmentation" and getattr(self.model.args, "do_segmentation", True):
                 _, _, H, W, _ = pixel_values.shape
                 output_size = (H // ps * hr_upsample_ratio, W // ps * hr_upsample_ratio)
                 hr_image_features = self.model.upsample_img_features(

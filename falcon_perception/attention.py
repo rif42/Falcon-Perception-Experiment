@@ -11,12 +11,18 @@ from torch.nn.attention.flex_attention import (
     or_masks,
 )
 
-# Compiled flex_attention variants:
+# Compiled flex_attention variants (disabled on CPU/Windows without C++ compiler — fallback to eager)
 # - _decode: fullgraph=True, static shapes — for decode (S_q==1), CUDA-graph safe.
 # - _prefill: dynamic=True, symbolic shapes — for prefill (S_q>1), one graph handles all lengths.
-compiled_flex_attn_decode = torch.compile(flex_attention, fullgraph=True)
-compiled_flex_attn_prefill = torch.compile(flex_attention, dynamic=True)
-_compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
+import os as _os
+if _os.environ.get("TORCHINDUCTOR_DISABLE") == "1" or not torch.cuda.is_available():
+    compiled_flex_attn_decode = flex_attention  # type: ignore
+    compiled_flex_attn_prefill = flex_attention  # type: ignore
+    _compiled_create_block_mask = create_block_mask  # type: ignore
+else:
+    compiled_flex_attn_decode = torch.compile(flex_attention, fullgraph=True)
+    compiled_flex_attn_prefill = torch.compile(flex_attention, dynamic=True)
+    _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
 
 
 def offset_mask_mod(mask_mod: _mask_mod_signature, offset: int):
